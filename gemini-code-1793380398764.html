@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EstoqueSmart - Baixa de Estoque NFC</title>
+  <!-- Tailwind CSS para design moderno e responsivo -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    body { background-color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+  </style>
+</head>
+<body class="p-3 sm:p-6 max-w-2xl mx-auto">
+
+  <!-- CABEÇALHO -->
+  <header class="flex items-center justify-between mb-6 bg-slate-900 text-white p-4 rounded-2xl shadow-lg">
+    <div class="flex items-center space-x-3">
+      <div class="bg-blue-500 p-2.5 rounded-xl">
+        <i data-lucide="box" class="w-6 h-6 text-white"></i>
+      </div>
+      <div>
+        <h1 class="text-lg font-bold">EstoqueSmart</h1>
+        <p class="text-xs text-slate-400">Controle Não Fiscal por NFC</p>
+      </div>
+    </div>
+    <span class="bg-blue-500/20 text-blue-400 text-xs px-3 py-1 rounded-full font-semibold border border-blue-500/30">
+      NFC Ativo
+    </span>
+  </header>
+
+  <!-- PAINEL PRINCIPAL DE BAIXA -->
+  <main class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200 mb-6">
+    
+    <!-- BUSCA / LEITURA MANUAL -->
+    <div class="mb-5">
+      <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">
+        Buscar ou Ler Código
+      </label>
+      <div class="relative">
+        <input type="text" id="searchInput" placeholder="Digite o Código ou Descrição do Produto..." 
+          class="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm font-medium">
+        <button onclick="buscarProduto()" class="absolute right-2 top-2 bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700">
+          <i data-lucide="search" class="w-4 h-4"></i>
+        </button>
+      </div>
+      <div id="searchResults" class="hidden mt-2 bg-white border border-slate-200 rounded-xl shadow-xl max-h-48 overflow-y-auto divide-y"></div>
+    </div>
+
+    <!-- CARD DO PRODUTO SELECIONADO -->
+    <div id="productCard" class="hidden">
+      <div class="bg-blue-50/50 border border-blue-100 rounded-xl p-4 mb-5">
+        <div class="flex justify-between items-start mb-2">
+          <span id="pCode" class="text-xs font-bold bg-blue-600 text-white px-2.5 py-1 rounded-md">COD: ---</span>
+          <span id="pGroup" class="text-xs font-semibold text-slate-500 bg-slate-200 px-2 py-0.5 rounded">GRUPO</span>
+        </div>
+        
+        <h2 id="pDesc" class="text-base font-bold text-slate-900 mb-1">---</h2>
+        
+        <div class="grid grid-cols-2 gap-2 text-xs text-slate-600 mt-3 pt-3 border-t border-blue-100">
+          <div><strong class="text-slate-400">Fornecedor:</strong> <span id="pSupplier">---</span></div>
+          <div><strong class="text-slate-400">Unidade:</strong> <span id="pUnit">---</span></div>
+          <div><strong class="text-slate-400">Tamanho:</strong> <span id="pSize">---</span></div>
+          <div><strong class="text-slate-400">Saldo Atual:</strong> <span id="pQty" class="font-bold text-blue-700 text-sm">0</span></div>
+        </div>
+      </div>
+
+      <!-- FORMULÁRIO DE BAIXA -->
+      <form id="baixaForm" onsubmit="confirmarBaixa(event)" class="space-y-4">
+        <div>
+          <label class="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+            Quantidade a Retirar
+          </label>
+          <div class="flex items-center space-x-2">
+            <button type="button" onclick="alterarQtd(-1)" class="bg-slate-200 text-slate-800 p-3 rounded-xl hover:bg-slate-300 active:scale-95 transition">
+              <i data-lucide="minus" class="w-5 h-5"></i>
+            </button>
+            <input type="number" id="qtdBaixa" min="1" step="any" value="1" required 
+              class="w-full text-center bg-slate-50 border border-slate-300 rounded-xl py-3 text-xl font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <button type="button" onclick="alterarQtd(1)" class="bg-slate-200 text-slate-800 p-3 rounded-xl hover:bg-slate-300 active:scale-95 transition">
+              <i data-lucide="plus" class="w-5 h-5"></i>
+            </button>
+          </div>
+        </div>
+
+        <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3.5 rounded-xl shadow-lg shadow-emerald-600/20 flex items-center justify-center space-x-2 active:scale-[0.98] transition">
+          <i data-lucide="check-circle" class="w-5 h-5"></i>
+          <span>Confirmar Baixa de Estoque</span>
+        </button>
+      </form>
+    </div>
+
+    <!-- MENSAGEM INICIAL -->
+    <div id="emptyState" class="text-center py-10 text-slate-400">
+      <i data-lucide="qr-code" class="w-12 h-12 mx-auto mb-3 opacity-40"></i>
+      <p class="text-sm font-medium">Aproxime a Tag NFC ou busque um produto acima para dar baixa.</p>
+    </div>
+
+  </main>
+
+  <!-- HISTÓRICO RECENTE DE MOVIMENTAÇÕES -->
+  <section class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-sm font-bold text-slate-800 flex items-center gap-2">
+        <i data-lucide="history" class="w-4 h-4 text-blue-600"></i> Histórico de Saídas
+      </h3>
+      <button onclick="limparHistorico()" class="text-xs text-rose-600 hover:underline">Limpar</button>
+    </div>
+    <div id="historicoList" class="space-y-2 max-h-60 overflow-y-auto text-xs">
+      <p class="text-slate-400 text-center py-4">Nenhuma movimentação realizada nesta sessão.</p>
+    </div>
+  </section>
+
+  <!-- SCRIPT LÓGICO E BANCO DE DADOS -->
+  <script>
+    // Inicialização dos Ícones Lucide
+    lucide.createIcons();
+
+    let dbProdutos = [];
+    let produtoAtual = null;
+
+    // Carrega a base extraída do Gdoor (produtos_database.json) ou localStorage
+    async function carregarBancoDeDados() {
+      const localData = localStorage.getItem('estoque_db');
+      if (localData) {
+        dbProdutos = JSON.parse(localData);
+      } else {
+        try {
+          const res = await fetch('products_database.json');
+          dbProdutos = await res.json();
+          localStorage.setItem('estoque_db', JSON.stringify(dbProdutos));
+        } catch (e) {
+          console.warn("Carregando base demonstrativa.");
+        }
+      }
+      
+      // Verifica se a página foi aberta por uma Tag NFC (Ex: index.html?cod=000002)
+      const urlParams = new URLSearchParams(window.location.search);
+      const codeFromNFC = urlParams.get('cod');
+      if (codeFromNFC) {
+        selecionarProdutoPorCodigo(codeFromNFC);
+      }
+    }
+
+    // Busca rápida de produtos
+    document.getElementById('searchInput').addEventListener('input', function(e) {
+      const query = e.target.value.toLowerCase().trim();
+      const resultsDiv = document.getElementById('searchResults');
+      
+      if (query.length < 2) {
+        resultsDiv.classList.add('hidden');
+        return;
+      }
+
+      const matches = dbProdutos.filter(p => 
+        p.code.toLowerCase().includes(query) || 
+        p.description.toLowerCase().includes(query) ||
+        p.barcode.toLowerCase().includes(query)
+      ).slice(0, 6);
+
+      if (matches.length > 0) {
+        resultsDiv.innerHTML = matches.map(p => `
+          <div onclick="selecionarProdutoPorCodigo('${p.code}')" class="p-3 hover:bg-slate-50 cursor-pointer flex justify-between items-center">
+            <div>
+              <p class="font-bold text-xs text-slate-800">${p.description}</p>
+              <p class="text-[10px] text-slate-400">COD: ${p.code} | Forn: ${p.supplier || 'N/I'}</p>
+            </div>
+            <span class="text-xs font-semibold text-blue-600 bg-blue-50 px-2 py-1 rounded">${p.qty} ${p.unit}</span>
+          </div>
+        `).join('');
+        resultsDiv.classList.remove('hidden');
+      } else {
+        resultsDiv.classList.add('hidden');
+      }
+    });
+
+    function selecionarProdutoPorCodigo(codigo) {
+      document.getElementById('searchResults').classList.add('hidden');
+      produtoAtual = dbProdutos.find(p => p.code === codigo);
+
+      if (produtoAtual) {
+        document.getElementById('pCode').innerText = `COD: ${produtoAtual.code}`;
+        document.getElementById('pDesc').innerText = produtoAtual.description;
+        document.getElementById('pGroup').innerText = produtoAtual.group || 'GERAL';
+        document.getElementById('pSupplier').innerText = produtoAtual.supplier || 'N/I';
+        document.getElementById('pUnit').innerText = produtoAtual.unit;
+        document.getElementById('pSize').innerText = produtoAtual.size || 'N/A';
+        document.getElementById('pQty').innerText = `${produtoAtual.qty} ${produtoAtual.unit}`;
+
+        document.getElementById('emptyState').classList.add('hidden');
+        document.getElementById('productCard').classList.remove('hidden');
+        document.getElementById('qtdBaixa').value = 1;
+      } else {
+        alert('Produto não encontrado no banco de dados!');
+      }
+    }
+
+    function alterarQtd(val) {
+      const input = document.getElementById('qtdBaixa');
+      let current = parseFloat(input.value) || 1;
+      if (current + val >= 1) input.value = current + val;
+    }
+
+    function confirmarBaixa(e) {
+      e.preventDefault();
+      if (!produtoAtual) return;
+
+      const qtdBaixa = parseFloat(document.getElementById('qtdBaixa').value);
+      
+      // Atualiza o saldo no banco de dados local
+      produtoAtual.qty = round(produtoAtual.qty - qtdBaixa, 2);
+      
+      // Salva no localStorage
+      localStorage.setItem('estoque_db', JSON.stringify(dbProdutos));
+
+      // Atualiza a tela
+      document.getElementById('pQty').innerText = `${produtoAtual.qty} ${produtoAtual.unit}`;
+
+      // Registra no Histórico
+      registrarHistorico(produtoAtual, qtdBaixa);
+
+      alert(`✅ Baixa de ${qtdBaixa} ${produtoAtual.unit} realizada com sucesso!`);
+    }
+
+    function registrarHistorico(prod, qtd) {
+      const list = document.getElementById('historicoList');
+      const hora = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+      
+      const itemHTML = `
+        <div class="flex justify-between items-center bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+          <div>
+            <span class="font-bold text-slate-800">${prod.description}</span>
+            <p class="text-[10px] text-slate-400">${hora} • COD: ${prod.code}</p>
+          </div>
+          <span class="font-bold text-rose-600 bg-rose-50 px-2 py-0.5 rounded">- ${qtd} ${prod.unit}</span>
+        </div>
+      `;
+
+      if (list.querySelector('p')) list.innerHTML = '';
+      list.innerHTML = itemHTML + list.innerHTML;
+    }
+
+    function limparHistorico() {
+      document.getElementById('historicoList').innerHTML = '<p class="text-slate-400 text-center py-4">Nenhuma movimentação realizada nesta sessão.</p>';
+    }
+
+    function round(num, decimals) {
+      return Number(Math.round(num + "e" + decimals) + "e-" + decimals);
+    }
+
+    window.onload = carregarBancoDeDados;
+  </script>
+</body>
+</html>
