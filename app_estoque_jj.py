@@ -3,9 +3,9 @@ import pandas as pd
 import sqlite3
 import os
 import io
+import re
 from datetime import datetime, date
 import xml.etree.ElementTree as ET
-import plotly.express as px
 
 # Configuração da Página (Adaptada para Celular e Computador)
 st.set_page_config(
@@ -19,33 +19,34 @@ st.set_page_config(
 DB_FILE = "estoque_jj.db"
 CSV_INICIAL = "produtos_jj_embalagens.csv"
 PASTA_FOTOS = "fotos_avarias"
+SENHA_ZERAR = "6994"
 os.makedirs(PASTA_FOTOS, exist_ok=True)
 
 # Estilo Visual Orientado a Processos / Gestão à Vista (Kanban / Lean)
 st.markdown("""
     <style>
     .block-container {
-        padding-top: 1.5rem;
+        padding-top: 1.2rem;
         padding-bottom: 2rem;
     }
     .process-header {
         background: linear-gradient(90deg, #9E1B1B 0%, #781212 100%);
         color: white;
-        padding: 16px 22px;
+        padding: 15px 22px;
         border-radius: 10px;
-        margin-bottom: 18px;
+        margin-bottom: 16px;
         border-left: 8px solid #F5B041;
         box-shadow: 0 3px 8px rgba(0,0,0,0.12);
     }
     .process-header h2 {
         margin: 0;
-        font-size: 1.45rem;
+        font-size: 1.4rem;
         color: #FFFFFF !important;
         font-weight: 700;
     }
     .process-header p {
         margin: 4px 0 0 0;
-        font-size: 0.92rem;
+        font-size: 0.9rem;
         color: #FADBD8;
     }
     .step-badge {
@@ -62,15 +63,14 @@ st.markdown("""
     .stButton>button {
         border-radius: 8px;
         font-weight: 600;
-        transition: all 0.2s ease;
     }
     div[data-testid="stMetric"] {
         background-color: #FFFFFF;
         border: 1px solid #E5E8E8;
         border-left: 5px solid #9E1B1B;
-        padding: 12px 16px;
+        padding: 10px 14px;
         border-radius: 8px;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+        box-shadow: 0 1px 4px rgba(0,0,0,0.04);
     }
     div[data-testid="stMetricValue"] {
         color: #9E1B1B;
@@ -79,13 +79,12 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-def conectar_db():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
-
-# OTIMIZAÇÃO 1: Inicializa o banco e cria índices apenas UMA vez por sessão do servidor
-@st.cache_resource
-def inicializar_banco():
-    conn = conectar_db()
+# OTIMIZAÇÃO MÁXIMA DE ABERTURA: Conexão persistente em cache + WAL Mode
+@st.cache_resource(show_spinner=False)
+def obter_conexao():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     cursor = conn.cursor()
     
     cursor.execute("""
@@ -122,8 +121,12 @@ def inicializar_banco():
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='produtos'")
     if not cursor.fetchone():
         if os.path.exists(CSV_INICIAL):
-            df_init = pd.read_csv(CSV_INICIAL, dtype={'CODIGO': str, 'COD_BARRAS': str})
-            df_init['CODIGO'] = df_init['CODIGO'].str.zfill(6)
+            df_init = pd.read_csv(
+                CSV_INICIAL,
+                dtype={'CODIGO': str, 'COD_BARRAS': str},
+                low_memory=False
+            )
+            df_init['CODIGO'] = df_init['CODIGO'].astype(str).str.zfill(6)
             for col_extra, val_padrao in [
                 ('ULTIMA_MOV_DATA', ''),
                 ('ULTIMA_MOV_HORA', ''),
@@ -131,7 +134,7 @@ def inicializar_banco():
             ]:
                 if col_extra not in df_init.columns:
                     df_init[col_extra] = val_padrao
-            df_init.to_sql("produtos", conn, if_exists="replace", index=False)
+            df_init.to_sql("produtos", conn, if_exists="replace", index=False, chunksize=1000)
     else:
         cursor.execute("PRAGMA table_info(produtos)")
         colunas_prod = [col[1] for col in cursor.fetchall()]
@@ -139,41 +142,35 @@ def inicializar_banco():
             if col_extra not in colunas_prod:
                 cursor.execute(f"ALTER TABLE produtos ADD COLUMN {col_extra} TEXT DEFAULT ''")
     
-    # Criação de Índices SQL para deixar buscas e atualizações instantâneas
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_prod_codigo ON produtos(CODIGO)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_prod_ean ON produtos(COD_BARRAS)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_prod_grupo ON produtos(GRUPO)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mov_data ON movimentacoes(data_registro)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mov_resp ON movimentacoes(responsavel)")
     
     conn.commit()
-    conn.close()
-    return True
+    return conn
 
-inicializar_banco()
+conn_global = obter_conexao()
 
 if "carrinho_saida" not in st.session_state:
     st.session_state.carrinho_saida = []
 if "carrinho_entrada" not in st.session_state:
     st.session_state.carrinho_entrada = []
 
-# OTIMIZAÇÃO 2: Cache em memória RAM + Cálculo Vetorizado (100x mais rápido que .apply)
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def carregar_produtos():
-    conn = conectar_db()
-    df = pd.read_sql("SELECT * FROM produtos", conn)
-    conn.close()
-    
+    df = pd.read_sql("SELECT * FROM produtos", conn_global)
     for c in ["SALDO_DEPOSITO", "SALDO_LOJA", "ESTOQUE_MINIMO", "PRECO_VENDA"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
             
-    for c_txt in ["ULTIMA_MOV_DATA", "ULTIMA_MOV_HORA", "ULTIMO_OPERADOR", "COD_BARRAS", "DESCRICAO", "GRUPO", "UND_VENDA"]:
+    for c_txt in ["CODIGO", "ULTIMA_MOV_DATA", "ULTIMA_MOV_HORA", "ULTIMO_OPERADOR", "COD_BARRAS", "DESCRICAO", "GRUPO", "UND_VENDA", "FORNECEDOR"]:
         if c_txt not in df.columns:
             df[c_txt] = ""
         else:
             df[c_txt] = df[c_txt].fillna("").astype(str)
             
-    # Semáforo Vetorizado (Instantâneo para 2.837 linhas)
     df["STATUS_ESTOQUE"] = "🟢 ESTOQUE CONFORTÁVEL"
     mask_alerta = (df["SALDO_DEPOSITO"] <= df["ESTOQUE_MINIMO"] * 1.25) & (df["SALDO_DEPOSITO"] >= df["ESTOQUE_MINIMO"])
     mask_abaixo = (df["SALDO_DEPOSITO"] < df["ESTOQUE_MINIMO"]) & (df["SALDO_DEPOSITO"] > 0)
@@ -183,29 +180,24 @@ def carregar_produtos():
     df.loc[mask_abaixo, "STATUS_ESTOQUE"] = "🟡 ABAIXO DO MÍNIMO (REPOR)"
     df.loc[mask_ruptura, "STATUS_ESTOQUE"] = "🔴 RUPTURA / ZERADO"
     
-    # Coluna de busca pré-calculada em cache
     df["BUSCA_RAPIDA"] = (
         df["CODIGO"] + " | " +
         df["DESCRICAO"] + " | EAN: " +
         df["COD_BARRAS"] + " [Saldo: " +
         df["SALDO_DEPOSITO"].round(1).astype(str) + " " +
-        df["UND_VENDA"] + " | Mín: " +
-        df["ESTOQUE_MINIMO"].round(1).astype(str) + "]"
+        df["UND_VENDA"] + " | Forn: " +
+        df["FORNECEDOR"].str[:20] + "]"
     )
     return df
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def carregar_movimentacoes():
-    conn = conectar_db()
-    df_m = pd.read_sql("SELECT * FROM movimentacoes ORDER BY id DESC", conn)
-    conn.close()
-    return df_m
+    return pd.read_sql("SELECT * FROM movimentacoes ORDER BY id DESC", conn_global)
 
 def limpar_caches():
     carregar_produtos.clear()
     carregar_movimentacoes.clear()
 
-# OTIMIZAÇÃO 3: Só gera o arquivo Excel quando o usuário realmente clicar para baixar
 @st.cache_data(show_spinner=False)
 def gerar_excel_bytes(df_export, nome_aba="Relatorio_Estoque"):
     output = io.BytesIO()
@@ -220,6 +212,115 @@ def carregar_logo():
             return f.read()
     return None
 
+def extrair_itens_nf(arq_nf, df_catalogo):
+    """Extrai itens tanto de XML padrão SEFAZ quanto de HTML de DANFE/ERP e identifica se já estão cadastrados."""
+    nome_arq = arq_nf.name.lower()
+    itens = []
+    fornecedor_nf = "FORNECEDOR NF"
+    numero_nf = arq_nf.name
+    
+    if nome_arq.endswith(".xml"):
+        tree = ET.parse(arq_nf)
+        root = tree.getroot()
+        for elem in root.iter():
+            tag_limpa = elem.tag.split("}")[-1]
+            if tag_limpa == "emit":
+                for sub in elem:
+                    if sub.tag.split("}")[-1] == "xNome" and sub.text:
+                        fornecedor_nf = sub.text.strip().upper()
+            elif tag_limpa == "nNF" and elem.text:
+                numero_nf = elem.text.strip()
+            elif tag_limpa == "prod":
+                cProd, cEAN, xProd, qCom, uCom = "", "", "", 0.0, "UN"
+                for child in elem:
+                    t = child.tag.split("}")[-1]
+                    if t == "cProd": cProd = (child.text or "").strip()
+                    elif t == "cEAN": cEAN = (child.text or "").strip()
+                    elif t == "xProd": xProd = (child.text or "").strip().upper()
+                    elif t == "qCom":
+                        try:
+                            qCom = float((child.text or "0").replace(",", "."))
+                        except:
+                            qCom = 0.0
+                    elif t == "uCom": uCom = (child.text or "UN").strip().upper()
+                itens.append({
+                    "COD_NF": cProd,
+                    "EAN_NF": cEAN if cEAN != "SEM GTIN" else "",
+                    "PRODUTO_NF": xProd,
+                    "QTD_NF": qCom,
+                    "UND_NF": uCom,
+                    "FORNECEDOR_NF": fornecedor_nf,
+                    "NUMERO_NF": numero_nf
+                })
+    else:
+        conteudo = arq_nf.read().decode("utf-8", errors="ignore")
+        try:
+            tabelas = pd.read_html(io.StringIO(conteudo), decimal=",", thousands=".")
+        except:
+            tabelas = []
+        for tab in tabelas:
+            if tab.shape[1] >= 3 and len(tab) >= 1:
+                df_t = tab.copy()
+                primeira_linha = " ".join(df_t.iloc[0].astype(str).tolist()).upper()
+                if any(k in primeira_linha for k in ["DESCRI", "PRODUTO", "QUANT", "CÓD", "COD", "UNID", "VALOR"]):
+                    df_t.columns = [str(c).strip().upper() for c in df_t.iloc[0]]
+                    df_t = df_t[1:].reset_index(drop=True)
+                else:
+                    df_t.columns = [str(c).strip().upper() for c in df_t.columns]
+                
+                col_desc = next((c for c in df_t.columns if any(k in c for k in ["DESCRI", "PRODUTO", "DISCRIMINA", "XPROD", "MERCADORIA"])), None)
+                col_qtd = next((c for c in df_t.columns if any(k in c for k in ["QUANT", "QTD", "QCOM"])), None)
+                col_cod = next((c for c in df_t.columns if any(k in c for k in ["CÓD", "COD", "CPROD", "ITEM", "REF"])), None)
+                col_ean = next((c for c in df_t.columns if any(k in c for k in ["EAN", "BARRA", "GTIN"])), None)
+                col_und = next((c for c in df_t.columns if any(k in c for k in ["UN", "UND", "UCOM", "MEDIDA"])), None)
+                col_forn = next((c for c in df_t.columns if "FORN" in c or "EMIT" in c), None)
+                
+                if col_desc and col_qtd:
+                    for _, r in df_t.iterrows():
+                        nome_p = str(r.get(col_desc, "")).strip().upper()
+                        if not nome_p or nome_p in ["NAN", "NONE", "DESCRIÇÃO", "PRODUTO"]:
+                            continue
+                        raw_q = str(r.get(col_qtd, "0")).strip()
+                        raw_q = re.sub(r"[^\d,.-]", "", raw_q)
+                        if "," in raw_q and "." in raw_q:
+                            raw_q = raw_q.replace(".", "").replace(",", ".")
+                        elif "," in raw_q:
+                            raw_q = raw_q.replace(",", ".")
+                        try:
+                            q_val = float(raw_q)
+                        except:
+                            q_val = 1.0
+                        c_val = str(r.get(col_cod, "")).strip() if col_cod else ""
+                        e_val = str(r.get(col_ean, "")).strip() if col_ean else ""
+                        u_val = str(r.get(col_und, "UN")).strip().upper() if col_und else "UN"
+                        f_val = str(r.get(col_forn, fornecedor_nf)).strip().upper() if col_forn else fornecedor_nf
+                        itens.append({
+                            "COD_NF": c_val if c_val.upper() != "NAN" else "",
+                            "EAN_NF": e_val if e_val.upper() not in ["NAN", "SEM GTIN"] else "",
+                            "PRODUTO_NF": nome_p,
+                            "QTD_NF": q_val if q_val > 0 else 1.0,
+                            "UND_NF": u_val if u_val != "NAN" else "UN",
+                            "FORNECEDOR_NF": f_val if f_val != "NAN" else "FORNECEDOR NF",
+                            "NUMERO_NF": numero_nf
+                        })
+                        
+    map_ean = dict(zip(df_catalogo[df_catalogo["COD_BARRAS"] != ""]["COD_BARRAS"], df_catalogo["CODIGO"]))
+    map_cod = dict(zip(df_catalogo["CODIGO"], df_catalogo["CODIGO"]))
+    map_desc = dict(zip(df_catalogo["DESCRICAO"].str.upper().str.strip(), df_catalogo["CODIGO"]))
+    
+    for it in itens:
+        cod_encontrado = None
+        if it["EAN_NF"] and it["EAN_NF"] in map_ean:
+            cod_encontrado = map_ean[it["EAN_NF"]]
+        elif it["COD_NF"] and it["COD_NF"].zfill(6) in map_cod:
+            cod_encontrado = it["COD_NF"].zfill(6)
+        elif it["PRODUTO_NF"] in map_desc:
+            cod_encontrado = map_desc[it["PRODUTO_NF"]]
+        it["CODIGO_VINCULADO"] = cod_encontrado
+        it["CADASTRADO"] = cod_encontrado is not None
+        
+    return itens
+
 # Barra Lateral com Logomarca, Identificação Obrigatória e Fluxo do Processo
 with st.sidebar:
     logo_bytes = carregar_logo()
@@ -227,7 +328,7 @@ with st.sidebar:
         st.image(logo_bytes, use_container_width=True)
     else:
         st.title("📦 JJ EMBALAGENS")
-    st.caption("Sistema de Gestão de Estoque e Processos (Alta Performance)")
+    st.caption("Gestão de Estoque e Processos (Ultra Rápido)")
     st.divider()
     
     st.markdown("### 👤 Identificação Obrigatória")
@@ -235,10 +336,10 @@ with st.sidebar:
         "Nome Completo do Responsável:",
         value="",
         placeholder="Digite seu nome para liberar...",
-        help="Obrigatório preencher o seu nome real para registrar qualquer entrada ou baixa no sistema."
+        help="Obrigatório preencher o seu nome real para registrar qualquer entrada, baixa ou ajuste."
     )
     if not operador.strip():
-        st.warning("⚠️ **Preencha seu nome acima.** O sistema exige identificação para registrar Data, Hora e Responsável.")
+        st.warning("⚠️ **Preencha seu nome acima.** Obrigatório para registrar Data, Hora e Responsável.")
     else:
         st.success(f"🟢 Operador Ativo: **{operador.strip().upper()}**")
         
@@ -249,10 +350,10 @@ with st.sidebar:
         [
             "📤 1. Dar Baixa / Retirada (Múltipla)",
             "📥 2. Entrada (Manual ou HTML/XML NF)",
-            "🔍 3. Relatório de Estoque e Exportação",
-            "📊 4. Gráficos e Painel por Grupo",
-            "📸 5. Auditoria de Movimentações e Avarias",
-            "⚙️ 6. Cadastrar / Definir Estoque Mínimo"
+            "➕ 3. Cadastrar Produto / Zerar Estoque",
+            "🔍 4. Relatório de Estoque e Exportação",
+            "📊 5. Gráficos e Painel por Grupo",
+            "📸 6. Auditoria de Movimentações e Avarias"
         ]
     )
 
@@ -260,7 +361,7 @@ df_produtos = carregar_produtos()
 opcoes_busca = [""] + df_produtos["BUSCA_RAPIDA"].tolist()
 
 # ==============================================================================
-# TELA 1: DAR BAIXA / RETIRADA MÚLTIPLA (COM FORMULÁRIO PARA EVITAR RECARREGAMENTO)
+# TELA 1: DAR BAIXA / RETIRADA MÚLTIPLA + ATALHO DE ZERAR ESTOQUE COM SENHA (6994)
 # ==============================================================================
 if menu.startswith("📤"):
     st.markdown("""
@@ -272,7 +373,6 @@ if menu.startswith("📤"):
     
     st.markdown('<span class="step-badge">ETAPA 1: SELECIONAR PRODUTOS PARA O ROMANEIO</span>', unsafe_allow_html=True)
     
-    # Uso de st.form evita que o app recarregue a cada dígito na quantidade
     with st.form("form_add_saida", clear_on_submit=False):
         col_busca, col_qtd, col_btn = st.columns([3.2, 1, 1.2])
         with col_busca:
@@ -305,6 +405,58 @@ if menu.startswith("📤"):
                     "ESTOQUE_MINIMO": float(prod_row["ESTOQUE_MINIMO"])
                 })
                 st.success(f"Adicionado à lista: {prod_row['DESCRICAO']} ({qtd_retirada} {prod_row['UND_VENDA']})")
+
+    # Atalho Rápido para Zerar Estoque do Produto com Senha Obrigatória (6994)
+    with st.expander("🚨 Precisa ZERAR o estoque de um produto imediatamente? (Requer Senha de Autorização)"):
+        with st.form("form_zerar_rapido"):
+            cz1, cz2, cz3, cz4 = st.columns([2.5, 1.2, 1, 1.2])
+            prod_zerar_rap = cz1.selectbox("Produto para Zerar Saldo:", options=opcoes_busca, key="zerar_rap_sel")
+            motivo_zerar_rap = cz2.text_input("Motivo do Zeramento:", value="Ajuste de Inventário / Zeramento")
+            senha_dig_rap = cz3.text_input("🔑 Senha Obrigatória:", type="password", placeholder="Senha...")
+            cz4.write("")
+            cz4.write("")
+            btn_zerar_rap = cz4.form_submit_button("🚨 Zerar Estoque Agora", use_container_width=True)
+            
+            if btn_zerar_rap:
+                if not operador.strip():
+                    st.error("🚫 Informe o seu Nome Completo na barra lateral antes de zerar o estoque!")
+                elif prod_zerar_rap == "":
+                    st.warning("Selecione o produto que deseja zerar.")
+                elif senha_dig_rap != SENHA_ZERAR:
+                    st.error("🚫 SENHA INCORRETA! Operação bloqueada. A senha de autorização é obrigatória.")
+                else:
+                    cod_z = prod_zerar_rap.split(" | ")[0]
+                    p_z = df_produtos[df_produtos["CODIGO"] == cod_z].iloc[0]
+                    saldo_ant = float(p_z["SALDO_DEPOSITO"])
+                    nome_op = operador.strip().upper()
+                    data_str = date.today().strftime("%Y-%m-%d")
+                    hora_str = datetime.now().strftime("%H:%M:%S")
+                    data_hora_str = f"{date.today().strftime('%d/%m/%Y')} {hora_str}"
+                    id_rom = "ZERO-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                    
+                    cur = conn_global.cursor()
+                    cur.execute("""
+                        UPDATE produtos 
+                        SET SALDO_DEPOSITO = 0.0,
+                            ULTIMA_MOV_DATA = ?,
+                            ULTIMA_MOV_HORA = ?,
+                            ULTIMO_OPERADOR = ?
+                        WHERE CODIGO = ?
+                    """, (data_str, hora_str, nome_op, cod_z))
+                    cur.execute("""
+                        INSERT INTO movimentacoes 
+                        (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        id_rom, data_str, hora_str, data_hora_str, "ZERAMENTO DE ESTOQUE",
+                        "Estoque Zerado via Senha", cod_z, p_z["COD_BARRAS"], p_z["DESCRICAO"],
+                        p_z["GRUPO"], saldo_ant, p_z["UND_VENDA"], nome_op, "",
+                        f"Saldo anterior ({saldo_ant}) zerado com senha. Motivo: {motivo_zerar_rap}", ""
+                    ))
+                    conn_global.commit()
+                    limpar_caches()
+                    st.success(f"✅ Estoque do produto '{p_z['DESCRICAO']}' (Cód: {cod_z}) foi ZERADO com sucesso por {nome_op}!")
+                    st.rerun()
 
     st.divider()
     
@@ -385,9 +537,7 @@ if menu.startswith("📤"):
                     with open(caminho_salvo, "wb") as f:
                         f.write(foto_avaria.getbuffer())
                         
-                conn = conectar_db()
-                cur = conn.cursor()
-                
+                cur = conn_global.cursor()
                 for item in st.session_state.carrinho_saida:
                     cur.execute("""
                         UPDATE produtos 
@@ -413,58 +563,126 @@ if menu.startswith("📤"):
                         item["CODIGO"], item["COD_BARRAS"], item["DESCRICAO"], item["GRUPO"],
                         item["QUANTIDADE"], item["UNIDADE"], nome_final, "", observacao, caminho_salvo
                     ))
-                conn.commit()
-                conn.close()
+                conn_global.commit()
                 limpar_caches()
                 st.session_state.carrinho_saida = []
                 st.success(f"✅ Baixa registrada com sucesso! Romaneio: {id_rom} | Responsável: {nome_final} | Data/Hora: {data_hora_str}")
                 st.rerun()
 
 # ==============================================================================
-# TELA 2: ENTRADA DE PRODUTOS (MANUAL EM LOTE OU HTML/XML DA NOTA FISCAL)
+# TELA 2: ENTRADA DE PRODUTOS (MANUAL, CADASTRAR NOVO DIRETO OU NF COM AUTO-CADASTRO)
 # ==============================================================================
 elif menu.startswith("📥"):
     st.markdown("""
         <div class="process-header">
             <h2>📥 Processo de Recebimento e Entrada de Mercadorias</h2>
-            <p>Fluxo Padronizado: Conferência Física ou Importação de NF (HTML/XML) ➔ Conversão de Embalagem ➔ Registro de Responsável, Data e Hora</p>
+            <p>Fluxo Padronizado: Entrada Manual, Cadastro Direto de Produto Novo ou Importação de NF (HTML/XML) com reconhecimento automático de itens não cadastrados</p>
         </div>
     """, unsafe_allow_html=True)
     
-    aba_manual, aba_nf = st.tabs(["📝 Entrada Manual em Lote", "📄 Importar HTML / XML da Nota Fiscal"])
+    aba_manual, aba_nf = st.tabs(["📝 1. Entrada Manual (ou Cadastrar Novo Produto)", "📄 2. Importar HTML / XML da Nota Fiscal"])
     
     with aba_manual:
-        with st.form("form_add_entrada", clear_on_submit=False):
-            c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-            with c1:
-                prod_ent = st.selectbox("Selecione o Produto Recebido:", options=opcoes_busca, key="ent_sel")
-            with c2:
-                qtd_ent = st.number_input("Qtd Recebida:", min_value=0.01, value=1.0, step=1.0, key="ent_qtd")
-            with c3:
-                fator_mult = st.number_input("Unid. por Caixa/Fardo:", min_value=1.0, value=1.0, step=1.0)
-            with c4:
-                st.write("")
-                st.write("")
-                btn_inc_ent = st.form_submit_button("➕ Incluir no Lote", use_container_width=True, type="primary")
+        tipo_acao_manual = st.radio(
+            "Como deseja dar entrada no produto?",
+            [
+                "📦 Selecionar Produto Já Cadastrado no Catálogo",
+                "➕ Cadastrar Novo Produto Manualmente (Código, Nome, Fornecedor e Quantidade)"
+            ],
+            horizontal=True
+        )
+        
+        if tipo_acao_manual.startswith("📦"):
+            with st.form("form_add_entrada", clear_on_submit=False):
+                c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+                with c1:
+                    prod_ent = st.selectbox("Selecione o Produto Recebido:", options=opcoes_busca, key="ent_sel")
+                with c2:
+                    qtd_ent = st.number_input("Qtd Recebida:", min_value=0.01, value=1.0, step=1.0, key="ent_qtd")
+                with c3:
+                    fator_mult = st.number_input("Unid. por Caixa/Fardo:", min_value=1.0, value=1.0, step=1.0)
+                with c4:
+                    st.write("")
+                    st.write("")
+                    btn_inc_ent = st.form_submit_button("➕ Incluir no Lote", use_container_width=True, type="primary")
+                    
+                if btn_inc_ent:
+                    if prod_ent == "":
+                        st.warning("Selecione um produto.")
+                    else:
+                        cod_e = prod_ent.split(" | ")[0]
+                        p_row = df_produtos[df_produtos["CODIGO"] == cod_e].iloc[0]
+                        qtd_final = float(qtd_ent * fator_mult)
+                        st.session_state.carrinho_entrada.append({
+                            "CODIGO": p_row["CODIGO"],
+                            "COD_BARRAS": p_row["COD_BARRAS"],
+                            "DESCRICAO": p_row["DESCRICAO"],
+                            "FORNECEDOR": p_row["FORNECEDOR"],
+                            "GRUPO": p_row["GRUPO"],
+                            "QTD_TOTAL_ENTRADA": qtd_final,
+                            "UNIDADE": p_row["UND_VENDA"]
+                        })
+                        st.success(f"Incluído no lote: {p_row['DESCRICAO']} (+{qtd_final} {p_row['UND_VENDA']})")
+        else:
+            st.markdown('<span class="step-badge">CADASTRO RÁPIDO MANUAL + ENTRADA DE ESTOQUE</span>', unsafe_allow_html=True)
+            prox_cod_sugerido = str(len(df_produtos) + 39).zfill(6)
+            with st.form("form_cad_manual_direto", clear_on_submit=True):
+                cm1, cm2, cm3, cm4 = st.columns([1.2, 2.5, 2, 1.2])
+                cod_novo_man = cm1.text_input("🔢 Código do Produto *:", value=prox_cod_sugerido, placeholder="Ex: 002876")
+                nome_novo_man = cm2.text_input("🏷️ Nome do Produto *:", placeholder="Ex: SACOLA KRAFT DELIVERY M")
+                forn_novo_man = cm3.text_input("🏭 Fornecedor *:", placeholder="Ex: EPV EMBALAGENS LTDA")
+                qtd_novo_man = cm4.number_input("📦 Quantidade Inicial *:", min_value=0.0, value=1.0, step=1.0)
                 
-            if btn_inc_ent:
-                if prod_ent == "":
-                    st.warning("Selecione um produto.")
-                else:
-                    cod_e = prod_ent.split(" | ")[0]
-                    p_row = df_produtos[df_produtos["CODIGO"] == cod_e].iloc[0]
-                    qtd_final = float(qtd_ent * fator_mult)
-                    st.session_state.carrinho_entrada.append({
-                        "CODIGO": p_row["CODIGO"],
-                        "COD_BARRAS": p_row["COD_BARRAS"],
-                        "DESCRICAO": p_row["DESCRICAO"],
-                        "GRUPO": p_row["GRUPO"],
-                        "QTD_TOTAL_ENTRADA": qtd_final,
-                        "UNIDADE": p_row["UND_VENDA"]
-                    })
-                    st.success(f"Incluído no lote: {p_row['DESCRICAO']} (+{qtd_final} {p_row['UND_VENDA']})")
+                cm5, cm6, cm7 = st.columns(3)
+                und_novo_man = cm5.selectbox("Unidade:", ["UN", "CX", "PCT", "FD", "KGS", "MLH", "RL"])
+                grupo_novo_man = cm6.text_input("Grupo / Família:", value="GERAL")
+                min_novo_man = cm7.number_input("Estoque Mínimo de Segurança:", min_value=0.0, value=10.0, step=1.0)
+                
+                if st.form_submit_button("💾 Cadastrar Produto e Dar Entrada no Estoque", type="primary", use_container_width=True):
+                    nome_op = operador.strip().upper()
+                    if not nome_op:
+                        st.error("🚫 Preencha o seu Nome Completo na barra lateral para registrar o cadastro!")
+                    elif not cod_novo_man.strip() or not nome_novo_man.strip() or not forn_novo_man.strip():
+                        st.error("🚫 Preencha obrigatoriamente o Código do Produto, Nome do Produto e Fornecedor!")
+                    else:
+                        cod_fmt = cod_novo_man.strip().zfill(6)
+                        if cod_fmt in df_produtos["CODIGO"].values:
+                            st.error(f"🚫 O código {cod_fmt} já está cadastrado no sistema! Escolha outro código.")
+                        else:
+                            data_str = date.today().strftime("%Y-%m-%d")
+                            hora_str = datetime.now().strftime("%H:%M:%S")
+                            data_hora_str = f"{date.today().strftime('%d/%m/%Y')} {hora_str}"
+                            id_rom = "CAD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                            
+                            cur = conn_global.cursor()
+                            cur.execute("""
+                                INSERT INTO produtos 
+                                (CODIGO, COD_BARRAS, DESCRICAO, UND_VENDA, UND_COMPRA, FATOR_CONVERSAO, GRUPO, FORNECEDOR, SALDO_DEPOSITO, SALDO_LOJA, ESTOQUE_MINIMO, PRECO_VENDA, SITUACAO, ULTIMA_MOV_DATA, ULTIMA_MOV_HORA, ULTIMO_OPERADOR)
+                                VALUES (?, ?, ?, ?, ?, 1.0, ?, ?, ?, 0.0, ?, 0.0, 'Ativo', ?, ?, ?)
+                            """, (
+                                cod_fmt, cod_fmt, nome_novo_man.strip().upper(), und_novo_man, und_novo_man,
+                                grupo_novo_man.strip().upper(), forn_novo_man.strip().upper(), float(qtd_novo_man),
+                                float(min_novo_man), data_str, hora_str, nome_op
+                            ))
+                            cur.execute("""
+                                INSERT INTO movimentacoes 
+                                (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                id_rom, data_str, hora_str, data_hora_str, "CADASTRO + ENTRADA",
+                                f"Fornecedor: {forn_novo_man.strip().upper()}", cod_fmt, cod_fmt,
+                                nome_novo_man.strip().upper(), grupo_novo_man.strip().upper(),
+                                float(qtd_novo_man), und_novo_man, nome_op, "",
+                                f"Cadastro manual direto com saldo inicial ({qtd_novo_man})", ""
+                            ))
+                            conn_global.commit()
+                            limpar_caches()
+                            st.success(f"✅ Produto '{nome_novo_man.strip().upper()}' (Cód: {cod_fmt}) cadastrado com Fornecedor '{forn_novo_man.strip().upper()}' e saldo de {qtd_novo_man} {und_novo_man}!")
+                            st.rerun()
                     
         if len(st.session_state.carrinho_entrada) > 0:
+            st.divider()
+            st.subheader("🛒 Lote de Entrada Manual")
             st.dataframe(pd.DataFrame(st.session_state.carrinho_entrada), use_container_width=True, hide_index=True)
             c_r1, c_r2, c_r3 = st.columns([2, 1, 2])
             resp_ent = c_r1.text_input("👤 Responsável pelo Recebimento (Obrigatório):", value=operador, key="resp_ent_man")
@@ -484,8 +702,7 @@ elif menu.startswith("📥"):
                     hora_str = datetime.now().strftime("%H:%M:%S")
                     data_hora_str = f"{data_br} {hora_str}"
                     
-                    conn = conectar_db()
-                    cur = conn.cursor()
+                    cur = conn_global.cursor()
                     for item in st.session_state.carrinho_entrada:
                         cur.execute("""
                             UPDATE produtos 
@@ -505,8 +722,7 @@ elif menu.startswith("📥"):
                             item["CODIGO"], item["COD_BARRAS"], item["DESCRICAO"], item["GRUPO"],
                             item["QTD_TOTAL_ENTRADA"], item["UNIDADE"], nome_ent, nf_man, obs_man, ""
                         ))
-                    conn.commit()
-                    conn.close()
+                    conn_global.commit()
                     limpar_caches()
                     st.session_state.carrinho_entrada = []
                     st.success(f"🎉 Entrada registrada! Protocolo: {id_rom} | Responsável: {nome_ent}")
@@ -516,104 +732,349 @@ elif menu.startswith("📥"):
                 st.rerun()
 
     with aba_nf:
-        st.write("Suba o arquivo **HTML** ou **XML** da Nota Fiscal para leitura automática dos itens.")
-        resp_nf = st.text_input("👤 Responsável pela Importação da NF (Obrigatório):", value=operador, key="resp_nf_imp")
+        st.write("Suba o arquivo **HTML** ou **XML** da Nota Fiscal. O sistema reconhece automaticamente quais produtos já estão cadastrados e **solicita o cadastro dos produtos novos** antes de dar a entrada.")
+        resp_nf = st.text_input("👤 Responsável pela Conferência/Importação da NF (Obrigatório):", value=operador, key="resp_nf_imp")
         arq_nf = st.file_uploader("Solte aqui o arquivo HTML ou XML da Nota Fiscal:", type=["html", "htm", "xml", "xls"])
         
         if arq_nf is not None:
-            itens_extraidos = []
-            nome_arq = arq_nf.name.lower()
             try:
-                if nome_arq.endswith(".xml"):
-                    tree = ET.parse(arq_nf)
-                    root = tree.getroot()
-                    for det in root.iter():
-                        if det.tag.endswith("prod"):
-                            cProd, cEAN, xProd, qCom, uCom = "", "", "", 0.0, ""
-                            for child in det:
-                                tag = child.tag.split("}")[-1]
-                                if tag == "cProd": cProd = child.text or ""
-                                elif tag == "cEAN": cEAN = child.text or ""
-                                elif tag == "xProd": xProd = child.text or ""
-                                elif tag == "qCom": qCom = float(child.text or 0)
-                                elif tag == "uCom": uCom = child.text or ""
-                            itens_extraidos.append({"COD_NF": cProd, "EAN_NF": cEAN, "PRODUTO_NF": xProd, "QTD_NF": qCom, "UND_NF": uCom})
+                itens_nf = extrair_itens_nf(arq_nf, df_produtos)
+                if len(itens_nf) == 0:
+                    st.warning("Não foram encontrados itens de produtos estruturados neste arquivo.")
                 else:
-                    conteudo = arq_nf.read().decode("utf-8", errors="ignore")
-                    tabelas = pd.read_html(conteudo, decimal=",", thousands=".")
-                    for t in tabelas:
-                        if t.shape[1] >= 3 and len(t) >= 1:
-                            itens_extraidos.append(t)
-                            
-                if nome_arq.endswith(".xml") and len(itens_extraidos) > 0:
-                    df_nf = pd.DataFrame(itens_extraidos)
-                    st.success(f"Foram identificados {len(df_nf)} produtos no XML da Nota Fiscal!")
-                    itens_para_confirmar = []
-                    for idx, row in df_nf.iterrows():
-                        match = df_produtos[(df_produtos["COD_BARRAS"] == str(row["EAN_NF"])) & (df_produtos["COD_BARRAS"] != "") & (df_produtos["COD_BARRAS"] != "SEM GTIN")]
-                        default_idx = 0
-                        if len(match) > 0:
-                            cod_m = match.iloc[0]["CODIGO"]
-                            for i_op, op in enumerate(opcoes_busca):
-                                if op.startswith(cod_m + " |"):
-                                    default_idx = i_op
-                                    break
-                        c_nf1, c_nf2, c_nf3 = st.columns([2, 2, 1])
-                        c_nf1.markdown(f"**NF:** {row['PRODUTO_NF']} <br><small>EAN: {row['EAN_NF']} | Cód: {row['COD_NF']}</small>", unsafe_allow_html=True)
-                        vinc = c_nf2.selectbox(f"Vincular ao Catálogo (Item {idx+1}):", options=opcoes_busca, index=default_idx, key=f"vinc_{idx}")
-                        qtd_vinc = c_nf3.number_input("Qtd a Somar:", value=float(row["QTD_NF"]), min_value=0.0, key=f"qvinc_{idx}")
-                        if vinc != "" and qtd_vinc > 0:
-                            cod_escolhido = vinc.split(" | ")[0]
-                            p_esc = df_produtos[df_produtos["CODIGO"] == cod_escolhido].iloc[0]
-                            itens_para_confirmar.append({
-                                "CODIGO": cod_escolhido,
-                                "COD_BARRAS": p_esc["COD_BARRAS"],
-                                "DESCRICAO": p_esc["DESCRICAO"],
-                                "GRUPO": p_esc["GRUPO"],
-                                "QTD": qtd_vinc,
-                                "UNIDADE": p_esc["UND_VENDA"]
-                            })
-                    if st.button("✅ Lançar Todos os Itens Vinculados da NF no Estoque", type="primary"):
-                        if not resp_nf.strip():
-                            st.error("🚫 Informe o nome do Responsável pela Importação da NF acima!")
-                        else:
-                            nome_nf = resp_nf.strip().upper()
-                            id_rom = "NF-" + datetime.now().strftime("%Y%m%d-%H%M%S")
-                            data_str = date.today().strftime("%Y-%m-%d")
-                            data_br = date.today().strftime("%d/%m/%Y")
-                            hora_str = datetime.now().strftime("%H:%M:%S")
-                            data_hora_str = f"{data_br} {hora_str}"
-                            conn = conectar_db()
-                            cur = conn.cursor()
-                            for it in itens_para_confirmar:
-                                cur.execute("""
-                                    UPDATE produtos 
-                                    SET SALDO_DEPOSITO = SALDO_DEPOSITO + ?,
-                                        ULTIMA_MOV_DATA = ?,
-                                        ULTIMA_MOV_HORA = ?,
-                                        ULTIMO_OPERADOR = ?
-                                    WHERE CODIGO = ?
-                                """, (it["QTD"], data_str, hora_str, nome_nf, it["CODIGO"]))
-                                cur.execute("""
-                                    INSERT INTO movimentacoes 
-                                    (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """, (id_rom, data_str, hora_str, data_hora_str, "ENTRADA NF", "Importação Automática NF", it["CODIGO"], it["COD_BARRAS"], it["DESCRICAO"], it["GRUPO"], it["QTD"], it["UNIDADE"], nome_nf, arq_nf.name, "Importado via arquivo NF", ""))
-                            conn.commit()
-                            conn.close()
-                            limpar_caches()
-                            st.success(f"Entrada da Nota Fiscal concluída por {nome_nf}!")
-                            st.rerun()
-                elif len(itens_extraidos) > 0:
-                    st.info("Tabelas encontradas no arquivo HTML da Nota Fiscal:")
-                    for idx_t, tab in enumerate(itens_extraidos):
-                        with st.expander(f"Tabela {idx_t+1} ({len(tab)} linhas)", expanded=(idx_t==0)):
-                            st.dataframe(tab, use_container_width=True)
+                    itens_cadastrados = [it for it in itens_nf if it["CADASTRADO"]]
+                    itens_nao_cadastrados = [it for it in itens_nf if not it["CADASTRADO"]]
+                    
+                    m_nf1, m_nf2, m_nf3 = st.columns(3)
+                    m_nf1.metric("Total de Itens na Nota Fiscal", len(itens_nf))
+                    m_nf2.metric("🟢 Produtos Já Cadastrados", len(itens_cadastrados))
+                    m_nf3.metric("🆕 Produtos NÃO Cadastrados", len(itens_nao_cadastrados))
+                    
+                    if len(itens_nao_cadastrados) > 0:
+                        st.warning(f"⚠️ **ATENÇÃO:** Foram encontrados **{len(itens_nao_cadastrados)} produto(s) na Nota Fiscal que ainda NÃO estão cadastrados** no catálogo. Confira/preencha os campos abaixo (Código, Nome, Fornecedor e Quantidade) para cadastrá-los e dar entrada automaticamente, ou vincule a um item existente:")
+                        
+                        with st.form("form_cadastrar_novos_nf"):
+                            dados_novos_nf = []
+                            base_seq = len(df_produtos) + 40
+                            for idx_n, it_n in enumerate(itens_nao_cadastrados):
+                                st.markdown(f"**🆕 Item Não Cadastrado #{idx_n + 1} da Nota Fiscal:** `{it_n['PRODUTO_NF']}`")
+                                cn1, cn2, cn3, cn4, cn5 = st.columns([1.1, 2.2, 1.8, 1, 1.8])
+                                cod_sug = it_n["COD_NF"].zfill(6) if (it_n["COD_NF"] and it_n["COD_NF"].isdigit() and it_n["COD_NF"].zfill(6) not in df_produtos["CODIGO"].values) else str(base_seq + idx_n).zfill(6)
+                                
+                                c_cod = cn1.text_input("Código *:", value=cod_sug, key=f"nf_nc_cod_{idx_n}")
+                                c_nome = cn2.text_input("Nome do Produto *:", value=it_n["PRODUTO_NF"], key=f"nf_nc_nom_{idx_n}")
+                                c_forn = cn3.text_input("Fornecedor *:", value=it_n["FORNECEDOR_NF"], key=f"nf_nc_forn_{idx_n}")
+                                c_qtd = cn4.number_input("Quantidade *:", value=float(it_n["QTD_NF"]), min_value=0.0, key=f"nf_nc_qtd_{idx_n}")
+                                c_vinc_opc = cn5.selectbox("Ou vincular a existente:", options=["[CADASTRAR COMO NOVO]"] + opcoes_busca[1:], key=f"nf_nc_vinc_{idx_n}")
+                                
+                                dados_novos_nf.append({
+                                    "CODIGO": c_cod.strip().zfill(6),
+                                    "EAN": it_n["EAN_NF"] or c_cod.strip().zfill(6),
+                                    "DESCRICAO": c_nome.strip().upper(),
+                                    "FORNECEDOR": c_forn.strip().upper(),
+                                    "QUANTIDADE": float(c_qtd),
+                                    "UNIDADE": it_n["UND_NF"] or "UN",
+                                    "VINCULO_EXISTENTE": c_vinc_opc,
+                                    "NUMERO_NF": it_n["NUMERO_NF"]
+                                })
+                                st.divider()
+                                
+                            btn_cad_lote_nf = st.form_submit_button("💾 Cadastrar Produtos Novos da NF e Somar ao Estoque", type="primary", use_container_width=True)
+                            if btn_cad_lote_nf:
+                                nome_op_nf = resp_nf.strip().upper()
+                                if not nome_op_nf:
+                                    st.error("🚫 Informe o Nome do Responsável acima antes de cadastrar os itens da NF!")
+                                else:
+                                    data_str = date.today().strftime("%Y-%m-%d")
+                                    hora_str = datetime.now().strftime("%H:%M:%S")
+                                    data_hora_str = f"{date.today().strftime('%d/%m/%Y')} {hora_str}"
+                                    id_rom = "NF-CAD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                                    cur = conn_global.cursor()
+                                    
+                                    for d_item in dados_novos_nf:
+                                        if d_item["VINCULO_EXISTENTE"] == "[CADASTRAR COMO NOVO]":
+                                            cur.execute("""
+                                                INSERT OR REPLACE INTO produtos 
+                                                (CODIGO, COD_BARRAS, DESCRICAO, UND_VENDA, UND_COMPRA, FATOR_CONVERSAO, GRUPO, FORNECEDOR, SALDO_DEPOSITO, SALDO_LOJA, ESTOQUE_MINIMO, PRECO_VENDA, SITUACAO, ULTIMA_MOV_DATA, ULTIMA_MOV_HORA, ULTIMO_OPERADOR)
+                                                VALUES (?, ?, ?, ?, ?, 1.0, 'GERAL', ?, ?, 0.0, 10.0, 0.0, 'Ativo', ?, ?, ?)
+                                            """, (
+                                                d_item["CODIGO"], d_item["EAN"], d_item["DESCRICAO"],
+                                                d_item["UNIDADE"], d_item["UNIDADE"], d_item["FORNECEDOR"],
+                                                d_item["QUANTIDADE"], data_str, hora_str, nome_op_nf
+                                            ))
+                                            cur.execute("""
+                                                INSERT INTO movimentacoes 
+                                                (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
+                                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                            """, (
+                                                id_rom, data_str, hora_str, data_hora_str, "CADASTRO + ENTRADA NF",
+                                                f"Fornecedor: {d_item['FORNECEDOR']}", d_item["CODIGO"], d_item["EAN"],
+                                                d_item["DESCRICAO"], "GERAL", d_item["QUANTIDADE"], d_item["UNIDADE"],
+                                                nome_op_nf, d_item["NUMERO_NF"], "Produto novo cadastrado via importação de NF", ""
+                                            ))
+                                        else:
+                                            cod_ex = d_item["VINCULO_EXISTENTE"].split(" | ")[0]
+                                            p_ex = df_produtos[df_produtos["CODIGO"] == cod_ex].iloc[0]
+                                            cur.execute("""
+                                                UPDATE produtos 
+                                                SET SALDO_DEPOSITO = SALDO_DEPOSITO + ?,
+                                                    ULTIMA_MOV_DATA = ?,
+                                                    ULTIMA_MOV_HORA = ?,
+                                                    ULTIMO_OPERADOR = ?
+                                                WHERE CODIGO = ?
+                                            """, (d_item["QUANTIDADE"], data_str, hora_str, nome_op_nf, cod_ex))
+                                            cur.execute("""
+                                                INSERT INTO movimentacoes 
+                                                (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
+                                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                            """, (
+                                                id_rom, data_str, hora_str, data_hora_str, "ENTRADA NF",
+                                                "Importação NF (Vinculado)", cod_ex, p_ex["COD_BARRAS"],
+                                                p_ex["DESCRICAO"], p_ex["GRUPO"], d_item["QUANTIDADE"], p_ex["UND_VENDA"],
+                                                nome_op_nf, d_item["NUMERO_NF"], "Entrada via NF", ""
+                                            ))
+                                    conn_global.commit()
+                                    limpar_caches()
+                                    st.success(f"✅ {len(dados_novos_nf)} produto(s) cadastrado(s) e lançado(s) no estoque com sucesso!")
+                                    st.rerun()
+                                    
+                    if len(itens_cadastrados) > 0:
+                        st.subheader(f"🟢 Produtos Já Cadastrados Reconhecidos na NF ({len(itens_cadastrados)} itens)")
+                        df_rec = pd.DataFrame(itens_cadastrados)[["CODIGO_VINCULADO", "EAN_NF", "PRODUTO_NF", "FORNECEDOR_NF", "QTD_NF", "UND_NF"]]
+                        st.dataframe(df_rec, use_container_width=True, hide_index=True)
+                        
+                        if st.button("✅ Confirmar Entrada dos Produtos Já Cadastrados da NF", type="primary", use_container_width=True):
+                            nome_op_nf = resp_nf.strip().upper()
+                            if not nome_op_nf:
+                                st.error("🚫 Informe o Nome do Responsável acima!")
+                            else:
+                                data_str = date.today().strftime("%Y-%m-%d")
+                                hora_str = datetime.now().strftime("%H:%M:%S")
+                                data_hora_str = f"{date.today().strftime('%d/%m/%Y')} {hora_str}"
+                                id_rom = "NF-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                                cur = conn_global.cursor()
+                                for it_c in itens_cadastrados:
+                                    cod_c = it_c["CODIGO_VINCULADO"]
+                                    p_c = df_produtos[df_produtos["CODIGO"] == cod_c].iloc[0]
+                                    cur.execute("""
+                                        UPDATE produtos 
+                                        SET SALDO_DEPOSITO = SALDO_DEPOSITO + ?,
+                                            ULTIMA_MOV_DATA = ?,
+                                            ULTIMA_MOV_HORA = ?,
+                                            ULTIMO_OPERADOR = ?
+                                        WHERE CODIGO = ?
+                                    """, (float(it_c["QTD_NF"]), data_str, hora_str, nome_op_nf, cod_c))
+                                    cur.execute("""
+                                        INSERT INTO movimentacoes 
+                                        (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        id_rom, data_str, hora_str, data_hora_str, "ENTRADA NF",
+                                        f"Fornecedor: {it_c['FORNECEDOR_NF']}", cod_c, p_c["COD_BARRAS"],
+                                        p_c["DESCRICAO"], p_c["GRUPO"], float(it_c["QTD_NF"]), p_c["UND_VENDA"],
+                                        nome_op_nf, it_c["NUMERO_NF"], "Entrada automática via NF", ""
+                                    ))
+                                conn_global.commit()
+                                limpar_caches()
+                                st.success(f"🎉 Entrada de {len(itens_cadastrados)} itens da Nota Fiscal registrada por {nome_op_nf}!")
+                                st.rerun()
             except Exception as e:
-                st.error(f"Erro ao ler arquivo: {e}")
+                st.error(f"Erro ao processar o arquivo da Nota Fiscal: {e}")
 
 # ==============================================================================
-# TELA 3: RELATÓRIO DE ESTOQUE, FILTRO POR DATA E PESSOA E DOWNLOAD SOB DEMANDA
+# TELA 3: CADASTRAR PRODUTO MANUALMENTE / ZERAR ESTOQUE COM SENHA (6994) / ESTOQUE MÍNIMO
+# ==============================================================================
+elif menu.startswith("➕"):
+    st.markdown("""
+        <div class="process-header">
+            <h2>➕ Cadastro Manual de Produtos, Zeramento com Senha e Estoque Mínimo</h2>
+            <p>Cadastre novos produtos (Código, Nome, Fornecedor e Quantidade), zere o saldo mediante senha (6994) ou parametrize o estoque mínimo</p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    aba_cad, aba_zerar, aba_min = st.tabs([
+        "➕ 1. Cadastrar Novo Produto (Manual)",
+        "🚨 2. Zerar Estoque de Produto (Requer Senha)",
+        "🛡️ 3. Definir Estoque Mínimo (Individual ou Lote)"
+    ])
+    
+    with aba_cad:
+        st.markdown('<span class="step-badge">CADASTRO MANUAL DE NOVO PRODUTO NO CATÁLOGO</span>', unsafe_allow_html=True)
+        st.write("Preencha os campos abaixo (**Código do Produto**, **Nome do Produto**, **Fornecedor** e **Quantidade**) para incluir um novo item no sistema.")
+        prox_cod = str(len(df_produtos) + 39).zfill(6)
+        
+        with st.form("form_cadastro_principal", clear_on_submit=True):
+            c1, c2 = st.columns([1, 2.5])
+            novo_cod = c1.text_input("🔢 Código do Produto *:", value=prox_cod, placeholder="Ex: 002876")
+            nova_desc = c2.text_input("🏷️ Nome / Descrição do Produto *:", placeholder="Ex: CAIXA PIZZA OITAVADA N35")
+            
+            c3, c4 = st.columns([2, 1.5])
+            novo_forn = c3.text_input("🏭 Fornecedor *:", placeholder="Ex: F.L. EMBALAGENS LTDA")
+            nova_qtd = c4.number_input("📦 Quantidade Inicial em Estoque *:", min_value=0.0, value=0.0, step=1.0)
+            
+            st.markdown("##### Informações Complementares (Opcionais)")
+            c5, c6, c7, c8 = st.columns(4)
+            novo_ean = c5.text_input("Código de Barras (EAN):", placeholder="Opcional")
+            nova_und = c6.selectbox("Unidade de Controle:", ["UN", "CX", "PCT", "FD", "KGS", "MLH", "RL"])
+            novo_grupo = c7.text_input("Grupo de Produtos:", value="GERAL")
+            novo_est_min = c8.number_input("🛡️ Estoque Mínimo de Segurança:", min_value=0.0, value=10.0, step=1.0)
+            
+            if st.form_submit_button("💾 Cadastrar Produto no Sistema", type="primary", use_container_width=True):
+                nome_op = operador.strip().upper()
+                if not nome_op:
+                    st.error("🚫 Informe o seu Nome Completo na barra lateral para registrar o cadastro!")
+                elif not novo_cod.strip() or not nova_desc.strip() or not novo_forn.strip():
+                    st.error("🚫 Os campos Código do Produto, Nome do Produto e Fornecedor são obrigatórios!")
+                else:
+                    cod_formatado = novo_cod.strip().zfill(6)
+                    if cod_formatado in df_produtos["CODIGO"].values:
+                        st.error(f"🚫 Já existe um produto com o código {cod_formatado}! Informe outro código.")
+                    else:
+                        ean_final = novo_ean.strip() if novo_ean.strip() else cod_formatado
+                        data_str = date.today().strftime("%Y-%m-%d")
+                        hora_str = datetime.now().strftime("%H:%M:%S")
+                        data_hora_str = f"{date.today().strftime('%d/%m/%Y')} {hora_str}"
+                        id_rom = "CAD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                        
+                        cur = conn_global.cursor()
+                        cur.execute("""
+                            INSERT INTO produtos 
+                            (CODIGO, COD_BARRAS, DESCRICAO, UND_VENDA, UND_COMPRA, FATOR_CONVERSAO, GRUPO, FORNECEDOR, SALDO_DEPOSITO, SALDO_LOJA, ESTOQUE_MINIMO, PRECO_VENDA, SITUACAO, ULTIMA_MOV_DATA, ULTIMA_MOV_HORA, ULTIMO_OPERADOR)
+                            VALUES (?, ?, ?, ?, ?, 1.0, ?, ?, ?, 0.0, ?, 0.0, 'Ativo', ?, ?, ?)
+                        """, (
+                            cod_formatado, ean_final, nova_desc.strip().upper(), nova_und, nova_und,
+                            novo_grupo.strip().upper(), novo_forn.strip().upper(), float(nova_qtd),
+                            float(novo_est_min), data_str, hora_str, nome_op
+                        ))
+                        cur.execute("""
+                            INSERT INTO movimentacoes 
+                            (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            id_rom, data_str, hora_str, data_hora_str, "CADASTRO MANUAL",
+                            f"Fornecedor: {novo_forn.strip().upper()}", cod_formatado, ean_final,
+                            nova_desc.strip().upper(), novo_grupo.strip().upper(), float(nova_qtd),
+                            nova_und, nome_op, "", "Cadastro manual de novo produto", ""
+                        ))
+                        conn_global.commit()
+                        limpar_caches()
+                        st.success(f"✅ Produto '{nova_desc.strip().upper()}' (Cód: {cod_formatado} | Fornecedor: {novo_forn.strip().upper()}) cadastrado com quantidade {nova_qtd} {nova_und}!")
+                        st.rerun()
+
+    with aba_zerar:
+        st.markdown('<span class="step-badge">OPERAÇÃO PROTEGIDA POR SENHA: ZERAR ESTOQUE DO PRODUTO SELECIONADO</span>', unsafe_allow_html=True)
+        st.warning("🔒 **Atenção:** Esta operação zera imediatamente o saldo em depósito do produto selecionado e grava a auditoria (Data, Hora e Pessoa). É obrigatório inserir a **senha de autorização**.")
+        
+        prod_para_zerar = st.selectbox(
+            "Selecione o Produto que deseja ZERAR o estoque:",
+            options=opcoes_busca,
+            key="sel_zerar_aba"
+        )
+        
+        if prod_para_zerar != "":
+            cod_z = prod_para_zerar.split(" | ")[0]
+            linha_z = df_produtos[df_produtos["CODIGO"] == cod_z].iloc[0]
+            
+            z1, z2, z3 = st.columns(3)
+            z1.metric("Código / Produto", f"{linha_z['CODIGO']} - {linha_z['DESCRICAO'][:28]}")
+            z2.metric("Saldo Atual no Depósito", f"{linha_z['SALDO_DEPOSITO']} {linha_z['UND_VENDA']}")
+            z3.metric("Fornecedor", str(linha_z["FORNECEDOR"])[:30])
+            
+            with st.form("form_zerar_estoque_aba"):
+                obs_zerar = st.text_input("Motivo / Justificativa para Zerar o Estoque *:", placeholder="Ex: Contagem física zerada / Ajuste de balanço...")
+                senha_zerar_input = st.text_input("🔑 Digite a Senha de Autorização Obrigatória *:", type="password", placeholder="Digite a senha de 4 dígitos...")
+                
+                if st.form_submit_button("🚨 Confirmar e ZERAR Estoque deste Produto", type="primary", use_container_width=True):
+                    nome_op = operador.strip().upper()
+                    if not nome_op:
+                        st.error("🚫 Preencha o seu Nome Completo na barra lateral antes de zerar o estoque!")
+                    elif senha_zerar_input != SENHA_ZERAR:
+                        st.error("🚫 **SENHA INCORRETA!** Você não tem permissão para zerar o estoque sem a senha correta.")
+                    elif not obs_zerar.strip():
+                        st.error("🚫 Informe o motivo/justificativa do zeramento!")
+                    else:
+                        saldo_ant = float(linha_z["SALDO_DEPOSITO"])
+                        data_str = date.today().strftime("%Y-%m-%d")
+                        hora_str = datetime.now().strftime("%H:%M:%S")
+                        data_hora_str = f"{date.today().strftime('%d/%m/%Y')} {hora_str}"
+                        id_rom = "ZERO-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                        
+                        cur = conn_global.cursor()
+                        cur.execute("""
+                            UPDATE produtos 
+                            SET SALDO_DEPOSITO = 0.0,
+                                ULTIMA_MOV_DATA = ?,
+                                ULTIMA_MOV_HORA = ?,
+                                ULTIMO_OPERADOR = ?
+                            WHERE CODIGO = ?
+                        """, (data_str, hora_str, nome_op, cod_z))
+                        
+                        cur.execute("""
+                            INSERT INTO movimentacoes 
+                            (id_romaneio, data_registro, hora_registro, data_hora, tipo_operacao, motivo_destino, codigo_produto, cod_barras, descricao, grupo, quantidade, unidade, responsavel, nf_numero, observacao, caminho_foto)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            id_rom, data_str, hora_str, data_hora_str, "ZERAMENTO DE ESTOQUE",
+                            "Estoque Zerado com Senha", cod_z, linha_z["COD_BARRAS"], linha_z["DESCRICAO"],
+                            linha_z["GRUPO"], saldo_ant, linha_z["UND_VENDA"], nome_op, "",
+                            f"Saldo anterior ({saldo_ant}) zerado mediante senha. Justificativa: {obs_zerar}", ""
+                        ))
+                        conn_global.commit()
+                        limpar_caches()
+                        st.success(f"✅ O estoque do produto '{linha_z['DESCRICAO']}' foi ZERADO com sucesso por {nome_op} às {hora_str}!")
+                        st.rerun()
+
+    with aba_min:
+        st.markdown('<span class="step-badge">AJUSTE DE ESTOQUE MÍNIMO EM LOTE OU INDIVIDUAL</span>', unsafe_allow_html=True)
+        grupos_todos = sorted(df_produtos["GRUPO"].unique().tolist())
+        with st.form("form_minimo_lote_grupo"):
+            cl1, cl2, cl3 = st.columns([2.2, 1.3, 1])
+            grupos_lote = cl1.multiselect("Selecione o(s) Grupo(s):", options=grupos_todos)
+            modo_aplicacao = cl2.radio("Regra:", ["Aplicar em todos do grupo", "Apenas onde Mínimo <= 5"])
+            valor_minimo_lote = cl3.number_input("🛡️ Novo Estoque Mínimo:", min_value=0.0, value=20.0, step=5.0)
+            
+            if st.form_submit_button("🚀 Aplicar Estoque Mínimo em Lote", type="primary", use_container_width=True):
+                if len(grupos_lote) == 0:
+                    st.warning("Selecione pelo menos um Grupo.")
+                else:
+                    cur = conn_global.cursor()
+                    placeholders = ",".join(["?"] * len(grupos_lote))
+                    if "Apenas" in modo_aplicacao:
+                        query_lote = f"UPDATE produtos SET ESTOQUE_MINIMO = ? WHERE GRUPO IN ({placeholders}) AND ESTOQUE_MINIMO <= 5"
+                    else:
+                        query_lote = f"UPDATE produtos SET ESTOQUE_MINIMO = ? WHERE GRUPO IN ({placeholders})"
+                    cur.execute(query_lote, [valor_minimo_lote] + grupos_lote)
+                    qtd_afetada = cur.rowcount
+                    conn_global.commit()
+                    limpar_caches()
+                    st.success(f"✅ Estoque Mínimo atualizado em {qtd_afetada} produtos!")
+                    st.rerun()
+                    
+        st.divider()
+        st.subheader("🛡️ Ajustar Estoque Mínimo ou Fornecedor Individualmente")
+        prod_ajuste = st.selectbox("Selecione o Produto:", options=opcoes_busca, key="sel_minimo_ind")
+        if prod_ajuste != "":
+            cod_aj = prod_ajuste.split(" | ")[0]
+            linha_p = df_produtos[df_produtos["CODIGO"] == cod_aj].iloc[0]
+            with st.form("form_atualizar_minimo"):
+                cm1, cm2, cm3 = st.columns(3)
+                novo_minimo = cm1.number_input("🛡️ Estoque Mínimo de Segurança:", min_value=0.0, value=float(linha_p["ESTOQUE_MINIMO"]), step=1.0)
+                novo_forn_aj = cm2.text_input("🏭 Fornecedor:", value=str(linha_p["FORNECEDOR"]))
+                novo_grupo_aj = cm3.text_input("📦 Grupo:", value=str(linha_p["GRUPO"]))
+                if st.form_submit_button("💾 Salvar Parâmetros do Produto", type="primary"):
+                    cur = conn_global.cursor()
+                    cur.execute("""
+                        UPDATE produtos 
+                        SET ESTOQUE_MINIMO = ?, FORNECEDOR = ?, GRUPO = ?
+                        WHERE CODIGO = ?
+                    """, (novo_minimo, novo_forn_aj.strip().upper(), novo_grupo_aj.strip().upper(), cod_aj))
+                    conn_global.commit()
+                    limpar_caches()
+                    st.success("✅ Dados do produto atualizados com sucesso!")
+                    st.rerun()
+
+# ==============================================================================
+# TELA 4: RELATÓRIO DE ESTOQUE, FILTRO POR DATA E PESSOA E DOWNLOAD SOB DEMANDA
 # ==============================================================================
 elif menu.startswith("🔍"):
     st.markdown("""
@@ -634,7 +1095,7 @@ elif menu.startswith("🔍"):
     st.markdown("### 🎛️ Filtros de Pesquisa (Por Produto, Grupo, Data e Pessoa)")
     f1, f2, f3, f4 = st.columns([2, 1.3, 1.3, 1.4])
     
-    termo = f1.text_input("🔎 Buscar por Nome, Código ou EAN:")
+    termo = f1.text_input("🔎 Buscar por Nome, Código, Fornecedor ou EAN:")
     grupo_sel = f2.selectbox("📦 Filtrar por Grupo:", ["Todos"] + sorted(df_produtos["GRUPO"].unique().tolist()))
     
     lista_pessoas = sorted([p for p in pd.concat([df_produtos["ULTIMO_OPERADOR"], df_mov_all["responsavel"]]).dropna().unique().tolist() if str(p).strip() != ""])
@@ -663,7 +1124,8 @@ elif menu.startswith("🔍"):
         df_view = df_view[
             df_view["DESCRICAO"].str.upper().str.contains(t_up, na=False) |
             df_view["CODIGO"].str.contains(t_up, na=False) |
-            df_view["COD_BARRAS"].str.contains(t_up, na=False)
+            df_view["COD_BARRAS"].str.contains(t_up, na=False) |
+            df_view["FORNECEDOR"].str.upper().str.contains(t_up, na=False)
         ]
     if grupo_sel != "Todos":
         df_view = df_view[df_view["GRUPO"] == grupo_sel]
@@ -690,15 +1152,14 @@ elif menu.startswith("🔍"):
         ]
         
     colunas_relatorio = [
-        "CODIGO", "COD_BARRAS", "DESCRICAO", "GRUPO", "UND_VENDA",
+        "CODIGO", "COD_BARRAS", "DESCRICAO", "FORNECEDOR", "GRUPO", "UND_VENDA",
         "SALDO_DEPOSITO", "SALDO_LOJA", "ESTOQUE_MINIMO", "STATUS_ESTOQUE",
-        "ULTIMA_MOV_DATA", "ULTIMA_MOV_HORA", "ULTIMO_OPERADOR", "PRECO_VENDA", "FORNECEDOR"
+        "ULTIMA_MOV_DATA", "ULTIMA_MOV_HORA", "ULTIMO_OPERADOR"
     ]
     
     st.markdown(f"**Exibindo {len(df_view)} produtos filtrados:**")
     st.dataframe(df_view[colunas_relatorio], use_container_width=True, hide_index=True, height=420)
     
-    # Download instantâneo em CSV e geração de Excel sob demanda (para não travar a tela a cada filtro)
     st.markdown("### 📥 Baixar Base de Estoque / Relatório Filtrado")
     dl1, dl2, dl3 = st.columns(3)
     
@@ -740,9 +1201,11 @@ elif menu.startswith("🔍"):
         )
 
 # ==============================================================================
-# TELA 4: ABA COM GRÁFICOS PARA FILTRAR QUANTIDADE DE ESTOQUE POR GRUPO
+# TELA 5: ABA COM GRÁFICOS PARA FILTRAR QUANTIDADE DE ESTOQUE POR GRUPO
 # ==============================================================================
 elif menu.startswith("📊"):
+    import plotly.express as px
+    
     st.markdown("""
         <div class="process-header">
             <h2>📊 Painel Analítico: Quantidade de Estoque por Grupo de Produtos</h2>
@@ -825,13 +1288,13 @@ elif menu.startswith("📊"):
     st.plotly_chart(fig_comp, use_container_width=True)
 
 # ==============================================================================
-# TELA 5: AUDITORIA DE MOVIMENTAÇÕES E AVARIAS
+# TELA 6: AUDITORIA DE MOVIMENTAÇÕES E AVARIAS
 # ==============================================================================
 elif menu.startswith("📸"):
     st.markdown("""
         <div class="process-header">
             <h2>📸 Histórico de Movimentações e Auditoria de Avarias</h2>
-            <p>Rastreabilidade total de quem retirou ou deu entrada, com filtro por Data, Hora, Pessoa e Galeria de Fotos de Avarias</p>
+            <p>Rastreabilidade total de quem retirou, cadastrou, deu entrada ou zerou estoque, com filtro por Data, Hora, Pessoa e Fotos</p>
         </div>
     """, unsafe_allow_html=True)
     
@@ -846,7 +1309,8 @@ elif menu.startswith("📸"):
             "Apenas Baixas (Saídas)",
             "Apenas Baixas por Avaria (com Foto)",
             "Apenas Reposição de Loja",
-            "Apenas Entradas"
+            "Apenas Entradas / Cadastros",
+            "Apenas Zeramentos de Estoque (Senha)"
         ])
         pessoas_hist = ["Todos"] + sorted([p for p in df_mov["responsavel"].dropna().unique().tolist() if str(p).strip() != ""])
         filtro_pessoa_hist = c_m2.selectbox("👤 Filtrar por Pessoa / Responsável:", pessoas_hist)
@@ -867,7 +1331,9 @@ elif menu.startswith("📸"):
         elif "Loja" in filtro_motivo:
             df_m_view = df_m_view[df_m_view["motivo_destino"].str.contains("Loja", na=False)]
         elif "Entradas" in filtro_motivo:
-            df_m_view = df_m_view[df_m_view["tipo_operacao"].str.contains("ENTRADA", na=False)]
+            df_m_view = df_m_view[df_m_view["tipo_operacao"].str.contains("ENTRADA|CADASTRO", na=False)]
+        elif "Zeramentos" in filtro_motivo:
+            df_m_view = df_m_view[df_m_view["tipo_operacao"].str.contains("ZERAMENTO", na=False)]
             
         if filtro_pessoa_hist != "Todos":
             df_m_view = df_m_view[df_m_view["responsavel"] == filtro_pessoa_hist]
@@ -900,176 +1366,3 @@ elif menu.startswith("📸"):
                     st.write(f"**Observação registrada:** {r_foto['observacao']}")
                     if os.path.exists(r_foto["caminho_foto"]):
                         st.image(r_foto["caminho_foto"], width=420)
-
-# ==============================================================================
-# TELA 6: CADASTRAR PRODUTO E DEFINIR ESTOQUE MÍNIMO DE SEGURANÇA (LOTE E INDIVIDUAL)
-# ==============================================================================
-elif menu.startswith("⚙️"):
-    st.markdown("""
-        <div class="process-header">
-            <h2>⚙️ Parametrização de Estoque Mínimo de Segurança (Individual e em Lote) e Cadastro</h2>
-            <p>Defina o estoque mínimo de segurança por produto, aplique em lote por Grupo/Família, edite diretamente na tabela ou cadastre novos SKUs</p>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    aba_lote, aba_minimo, aba_novo = st.tabs([
-        "📦 1. Definir Estoque Mínimo em Lote (Por Grupo ou Tabela)",
-        "🛡️ 2. Ajuste Individual de Produto",
-        "➕ 3. Cadastrar Novo Produto"
-    ])
-    
-    with aba_lote:
-        st.markdown('<span class="step-badge">OPÇÃO A: APLICAR ESTOQUE MÍNIMO EM LOTE POR GRUPO DE PRODUTOS</span>', unsafe_allow_html=True)
-        grupos_todos = sorted(df_produtos["GRUPO"].unique().tolist())
-        with st.form("form_minimo_lote_grupo"):
-            cl1, cl2, cl3 = st.columns([2.2, 1.3, 1])
-            grupos_lote = cl1.multiselect(
-                "Selecione o(s) Grupo(s) de Produtos:",
-                options=grupos_todos,
-                placeholder="Ex: ISOPOR:CAIXAS, PAPELAO, DESCARTAVEL:SACOLAS..."
-            )
-            modo_aplicacao = cl2.radio(
-                "Regra de Aplicação:",
-                [
-                    "Aplicar em todos os produtos do grupo",
-                    "Apenas nos que têm Estoque Mínimo <= 5"
-                ]
-            )
-            valor_minimo_lote = cl3.number_input(
-                "🛡️ Novo Estoque Mínimo para o Grupo:",
-                min_value=0.0,
-                value=20.0,
-                step=5.0
-            )
-            
-            if st.form_submit_button("🚀 Aplicar Estoque Mínimo em Lote aos Grupos Selecionados", type="primary", use_container_width=True):
-                if len(grupos_lote) == 0:
-                    st.warning("⚠️ Selecione pelo menos um Grupo de Produtos antes de aplicar.")
-                else:
-                    conn = conectar_db()
-                    cur = conn.cursor()
-                    placeholders = ",".join(["?"] * len(grupos_lote))
-                    if "Apenas" in modo_aplicacao:
-                        query_lote = f"UPDATE produtos SET ESTOQUE_MINIMO = ? WHERE GRUPO IN ({placeholders}) AND ESTOQUE_MINIMO <= 5"
-                    else:
-                        query_lote = f"UPDATE produtos SET ESTOQUE_MINIMO = ? WHERE GRUPO IN ({placeholders})"
-                    cur.execute(query_lote, [valor_minimo_lote] + grupos_lote)
-                    qtd_afetada = cur.rowcount
-                    conn.commit()
-                    conn.close()
-                    limpar_caches()
-                    st.success(f"✅ Estoque Mínimo atualizado em lote para {valor_minimo_lote} unidades em {qtd_afetada} produtos!")
-                    st.rerun()
-                    
-        st.divider()
-        st.markdown('<span class="step-badge">OPÇÃO B: EDIÇÃO RÁPIDA DIRETA NA TABELA (TIPO PLANILHA)</span>', unsafe_allow_html=True)
-        filtro_grp_ed = st.selectbox("Filtrar Grupo para Edição na Tabela:", options=["Mostrar Top 100 Produtos"] + grupos_todos, key="grp_ed_tab")
-        if filtro_grp_ed == "Mostrar Top 100 Produtos":
-            df_para_editar = df_produtos[["CODIGO", "COD_BARRAS", "DESCRICAO", "GRUPO", "UND_VENDA", "SALDO_DEPOSITO", "ESTOQUE_MINIMO", "STATUS_ESTOQUE"]].head(100).copy()
-        else:
-            df_para_editar = df_produtos[df_produtos["GRUPO"] == filtro_grp_ed][["CODIGO", "COD_BARRAS", "DESCRICAO", "GRUPO", "UND_VENDA", "SALDO_DEPOSITO", "ESTOQUE_MINIMO", "STATUS_ESTOQUE"]].copy()
-            
-        df_editado = st.data_editor(
-            df_para_editar,
-            disabled=["CODIGO", "COD_BARRAS", "DESCRICAO", "GRUPO", "UND_VENDA", "STATUS_ESTOQUE"],
-            use_container_width=True,
-            hide_index=True,
-            height=380,
-            key="editor_lote_tabela"
-        )
-        
-        if st.button("💾 Salvar Alterações da Tabela no Banco de Dados", type="primary"):
-            conn = conectar_db()
-            cur = conn.cursor()
-            dados_batch = [
-                (float(r_ed["SALDO_DEPOSITO"]), float(r_ed["ESTOQUE_MINIMO"]), str(r_ed["CODIGO"]))
-                for _, r_ed in df_editado.iterrows()
-            ]
-            cur.executemany("UPDATE produtos SET SALDO_DEPOSITO = ?, ESTOQUE_MINIMO = ? WHERE CODIGO = ?", dados_batch)
-            conn.commit()
-            conn.close()
-            limpar_caches()
-            st.success(f"✅ {len(dados_batch)} registros atualizados instantaneamente!")
-            st.rerun()
-
-    with aba_minimo:
-        st.subheader("🛡️ Ajustar Estoque Mínimo de Segurança Individualmente")
-        prod_ajuste = st.selectbox(
-            "Selecione o Produto para parametrizar:",
-            options=opcoes_busca,
-            key="sel_minimo"
-        )
-        
-        if prod_ajuste != "":
-            cod_aj = prod_ajuste.split(" | ")[0]
-            linha_p = df_produtos[df_produtos["CODIGO"] == cod_aj].iloc[0]
-            
-            c_i1, c_i2, c_i3 = st.columns(3)
-            c_i1.metric("Saldo Atual no Depósito", f"{linha_p['SALDO_DEPOSITO']} {linha_p['UND_VENDA']}")
-            c_i2.metric("Estoque Mínimo Atual", f"{linha_p['ESTOQUE_MINIMO']} {linha_p['UND_VENDA']}")
-            c_i3.metric("Diagnóstico Atual", linha_p["STATUS_ESTOQUE"])
-            
-            with st.form("form_atualizar_minimo"):
-                cm1, cm2, cm3 = st.columns(3)
-                novo_minimo = cm1.number_input(
-                    "🛡️ Novo Estoque Mínimo de Segurança:",
-                    min_value=0.0,
-                    value=float(linha_p["ESTOQUE_MINIMO"]),
-                    step=1.0
-                )
-                novo_saldo_dep = cm2.number_input(
-                    "📦 Saldo Físico no Depósito (Inventário):",
-                    value=float(linha_p["SALDO_DEPOSITO"]),
-                    step=1.0
-                )
-                novo_grupo_aj = cm3.text_input("Grupo do Produto:", value=str(linha_p["GRUPO"]))
-                
-                if st.form_submit_button("💾 Salvar Estoque Mínimo de Segurança", type="primary"):
-                    conn = conectar_db()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        UPDATE produtos 
-                        SET ESTOQUE_MINIMO = ?, SALDO_DEPOSITO = ?, GRUPO = ?
-                        WHERE CODIGO = ?
-                    """, (novo_minimo, novo_saldo_dep, novo_grupo_aj.upper(), cod_aj))
-                    conn.commit()
-                    conn.close()
-                    limpar_caches()
-                    st.success(f"✅ Estoque Mínimo do produto '{linha_p['DESCRICAO']}' atualizado para {novo_minimo} {linha_p['UND_VENDA']}!")
-                    st.rerun()
-
-    with aba_novo:
-        st.subheader("➕ Cadastrar Novo SKU no Catálogo")
-        with st.form("novo_prod_v4"):
-            c1, c2, c3 = st.columns(3)
-            novo_cod = c1.text_input("Código Interno (Ex: 002876):")
-            novo_ean = c2.text_input("Código de Barras (EAN):")
-            nova_und = c3.selectbox("Unidade de Controle:", ["UN", "CX", "PCT", "FD", "KGS", "MLH", "RL"])
-            nova_desc = st.text_input("Descrição Completa do Produto:")
-            c4, c5, c6, c7 = st.columns(4)
-            novo_grupo = c4.text_input("Grupo (Ex: DESCARTAVEL:SACOLAS):", value="GERAL")
-            novo_saldo = c5.number_input("Saldo Inicial no Depósito:", value=0.0)
-            novo_est_min = c6.number_input("🛡️ Estoque Mínimo de Segurança:", min_value=0.0, value=10.0)
-            novo_preco = c7.number_input("Preço de Venda (R$):", min_value=0.0, value=0.0)
-            
-            if st.form_submit_button("💾 Salvar Novo Produto no Catálogo", type="primary"):
-                if not novo_cod or not nova_desc:
-                    st.error("Preencha obrigatoriamente o Código e a Descrição do produto!")
-                else:
-                    conn = conectar_db()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        INSERT INTO produtos 
-                        (CODIGO, COD_BARRAS, DESCRICAO, UND_VENDA, UND_COMPRA, FATOR_CONVERSAO, GRUPO, FORNECEDOR, SALDO_DEPOSITO, SALDO_LOJA, ESTOQUE_MINIMO, PRECO_VENDA, SITUACAO, ULTIMA_MOV_DATA, ULTIMA_MOV_HORA, ULTIMO_OPERADOR)
-                        VALUES (?, ?, ?, ?, ?, 1.0, ?, 'CADASTRO MANUAL', ?, 0.0, ?, ?, 'Ativo', ?, ?, ?)
-                    """, (
-                        novo_cod.zfill(6), novo_ean, nova_desc.upper(), nova_und, nova_und,
-                        novo_grupo.upper(), novo_saldo, novo_est_min, novo_preco,
-                        date.today().strftime("%Y-%m-%d"), datetime.now().strftime("%H:%M:%S"),
-                        operador.strip().upper() if operador.strip() else "SISTEMA"
-                    ))
-                    conn.commit()
-                    conn.close()
-                    limpar_caches()
-                    st.success(f"✅ Produto '{nova_desc.upper()}' cadastrado com Estoque Mínimo de {novo_est_min} {nova_und}!")
-                    st.rerun()
